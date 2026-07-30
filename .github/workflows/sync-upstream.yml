@@ -1,0 +1,121 @@
+# Keeps this personal fork (feuerswut/AntennaPod) in lockstep with upstream
+# AntennaPod/AntennaPod so it can stay "set and forget".
+#
+# Two branches, two different jobs to do:
+#
+#   master  - the branch releases are built from. Upstream uses it as its
+#             release-staging branch, so it carries the version that is
+#             actually being shipped (it can be ahead of develop). This fork
+#             adds NOTHING to master: it is mirrored as a pure fast-forward of
+#             upstream/master. Because there are no fork-only commits on it, it
+#             can never conflict, and a push that would not fast-forward is
+#             rejected by git and fails this workflow instead of rewriting
+#             anything.
+#
+#   develop - the fork's default branch, and therefore the only branch GitHub
+#             reads scheduled workflows from. That is why this file and
+#             build-release.yml live here and not on master: a workflow file
+#             sitting only on master would never be triggered by `schedule` or
+#             `workflow_run` unless the repository's default branch were
+#             changed by hand. develop is kept as upstream/develop PLUS this
+#             fork's own automation commits.
+#
+# Keeping the automation on develop and the build source on master also means
+# master stays byte-for-byte identical to upstream, which makes the published
+# APK trivially auditable against upstream's own source.
+#
+# For develop, a plain fast-forward only succeeds while upstream has not moved.
+# Once upstream adds commits, our branch has the automation commit(s) upstream
+# does not have and upstream has commits we do not -> a normal, expected
+# divergence for this setup, not a sign that anything went wrong. So we:
+#   1. Try a plain --ff-only merge first (cheap, handles "nothing changed").
+#   2. If that is not possible, rebase ONLY this fork's own commit(s) onto the
+#      new upstream tip and force-push. This never touches upstream history and
+#      never discards anything: it replays our own automation commit(s) on top
+#      of the newer base, exactly like `git pull --rebase` would.
+#   3. If that rebase hits a real conflict (upstream changed something our
+#      commits also touch - realistically only .gitignore), we abort without
+#      pushing and fail loudly instead of guessing at a resolution. Nothing is
+#      force-pushed in that case.
+#
+# Note on ordering: master is mirrored first, because it is the payload and
+# cannot fail for fork-specific reasons. If the develop self-maintenance step
+# afterwards fails, master has still been updated - but build-release.yml will
+# not fire, since it keys off this workflow concluding successfully. In that
+# case fix develop by hand and either re-run this workflow or trigger
+# "Build and release (free flavor)" manually via workflow_dispatch.
+name: Sync upstream
+
+on:
+  schedule:
+    # Daily, off-peak UTC. The exact time does not matter, it just needs to be
+    # regular and not collide with everything else running at :00.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    # Guard so this never accidentally runs in someone else's fork/mirror of this fork.
+    if: github.repository == 'feuerswut/AntennaPod'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout develop
+        uses: actions/checkout@v5
+        with:
+          ref: develop
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/AntennaPod/AntennaPod.git
+
+      - name: Fetch upstream
+        run: git fetch upstream develop master
+
+      # No local checkout needed: master carries no fork-only commits, so this
+      # is a straight fast-forward of origin/master to upstream/master. git
+      # refuses a non-fast-forward push here, which is exactly what we want -
+      # if master ever diverged, something is wrong and a human should look.
+      - name: Mirror master from upstream
+        run: git push origin refs/remotes/upstream/master:refs/heads/master
+
+      - name: Attempt fast-forward of develop
+        id: ff
+        run: |
+          if git merge --ff-only upstream/develop; then
+            echo "result=ff-ok" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=diverged" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push fast-forwarded develop
+        if: steps.ff.outputs.result == 'ff-ok'
+        run: git push origin develop
+
+      - name: Rebase fork-only commits onto upstream and push
+        if: steps.ff.outputs.result == 'diverged'
+        run: |
+          set -e
+          if git rebase upstream/develop; then
+            git push --force-with-lease origin develop
+          else
+            git rebase --abort
+            echo "::error::Could not cleanly rebase this fork's own commit(s) onto upstream/develop." \
+                 " This means upstream now conflicts with something in this fork" \
+                 " (this fork only carries the .github/workflows automation commits plus one" \
+                 " .gitignore line, so a conflict here is unexpected). Nothing was pushed to develop." \
+                 " master was already mirrored successfully and is unaffected." \
+                 " Resolve by hand: fetch upstream, rebase locally, fix the conflict, force-push develop."
+            exit 1
+          fi
