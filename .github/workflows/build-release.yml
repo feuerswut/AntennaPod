@@ -1,0 +1,159 @@
+# Builds the "free" (FOSS) flavor of AntennaPod - no Google Play Services /
+# Firebase dependency, see playFlavor.gradle - and publishes it as a signed
+# GitHub Release whenever the sync-upstream workflow has successfully pulled
+# in new upstream commits (or on manual dispatch).
+#
+# BRANCHES: this file lives on develop because GitHub only triggers scheduled
+# and workflow_run events from workflow files on the repository's default
+# branch - but it BUILDS master, which is upstream's release-staging branch and
+# therefore the one carrying the version actually being shipped. master is kept
+# as a pure, unmodified mirror of upstream/master by sync-upstream.yml, so the
+# APK published here is built from untouched upstream source. See the comment
+# block at the top of sync-upstream.yml for the full rationale.
+#
+# The release tag is the upstream versionName from app/build.gradle
+# (e.g. "v3.12.0-beta4"), so this matches whatever version upstream is
+# actually shipping and lets external tooling (e.g. an F-Droid-style
+# "GitHub releases" fetcher pointed at this fork) pick it up without any
+# fork-specific version scheme.
+#
+# SIGNING: GitHub Actions cannot sign a release APK without a real keystore,
+# and this workflow will never generate or commit one. Before this workflow
+# can produce a signed APK, add these secrets in this repo's
+# Settings -> Secrets and variables -> Actions:
+#   KEYSTORE_BASE64    base64 of your release .keystore/.jks file
+#                       (e.g. `base64 -w0 release.keystore`)
+#   KEYSTORE_PASSWORD  the keystore's store password
+#   KEY_ALIAS          the signing key alias inside that keystore
+#   KEY_PASSWORD       the signing key's password
+# Until those four secrets exist, the "Decode signing keystore" step below
+# fails on purpose - that's expected and safe: it's better for the build to
+# fail loudly than to ship an unsigned or fake-signed APK.
+name: Build and release (free flavor)
+
+on:
+  workflow_run:
+    workflows: ["Sync upstream"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    if: >
+      github.repository == 'feuerswut/AntennaPod' &&
+      (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout master (upstream release branch)
+        uses: actions/checkout@v5
+        with:
+          ref: master
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - uses: gradle/actions/wrapper-validation@v5
+
+      - name: Cache Gradle
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('**/*.gradle*') }}-${{ hashFiles('**/gradle/wrapper/gradle-wrapper.properties') }}
+
+      - name: Read upstream version from app/build.gradle
+        id: version
+        run: |
+          version_name=$(grep -m1 'versionName ' app/build.gradle | sed -E 's/.*versionName\s+"([^"]+)".*/\1/')
+          if [ -z "$version_name" ]; then
+            echo "::error::Could not parse versionName from app/build.gradle"
+            exit 1
+          fi
+          echo "name=$version_name" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version_name" >> "$GITHUB_OUTPUT"
+          # Upstream's versionName carries a suffix for anything that is not a
+          # final release ("3.12.0-beta4", "-rc1"). Flag those as GitHub
+          # pre-releases so consumers can tell them apart - an F-Droid-style
+          # fetcher that keeps "newest beta + current stable" side by side has
+          # no other signal to go on, and would otherwise treat every beta as
+          # the current stable version.
+          if printf '%s' "$version_name" | grep -q -- '-'; then
+            echo "prerelease=--prerelease" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=--latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip if this version was already released
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${{ steps.version.outputs.tag }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${{ steps.version.outputs.tag }} already exists, nothing to do."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Secrets are passed through the environment, never interpolated into the
+      # shell script or the gradle command line: a password containing a quote,
+      # a backtick or a "$" would otherwise be mangled by the shell (silently
+      # producing a wrong password), and command-line arguments are visible to
+      # every other process on the runner.
+      - name: Decode signing keystore
+        if: steps.check.outputs.exists == 'false'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::Secret KEYSTORE_BASE64 is not set. Add KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS and KEY_PASSWORD in this repo's Settings -> Secrets and variables -> Actions before this workflow can produce a signed APK. Failing here on purpose rather than shipping an unsigned or fake-signed build."
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "${RUNNER_TEMP}/release.keystore"
+
+      # ORG_GRADLE_PROJECT_<name> is Gradle's documented way to set the project
+      # property <name>, i.e. exactly what app/build.gradle's signingConfigs
+      # .releaseConfig reads via project.getProperties(). If one of these were
+      # ever missing, the config falls back to a "keystore" file that does not
+      # exist and the build fails - it can never silently sign with a wrong key.
+      - name: Build signed free-flavor release APK
+        if: steps.check.outputs.exists == 'false'
+        env:
+          ORG_GRADLE_PROJECT_releaseStoreFile: ${{ runner.temp }}/release.keystore
+          ORG_GRADLE_PROJECT_releaseStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
+          ORG_GRADLE_PROJECT_releaseKeyAlias: ${{ secrets.KEY_ALIAS }}
+          ORG_GRADLE_PROJECT_releaseKeyPassword: ${{ secrets.KEY_PASSWORD }}
+        run: ./gradlew assembleFreeRelease --stacktrace
+
+      - name: Remove decoded keystore
+        if: always()
+        run: rm -f "${RUNNER_TEMP}/release.keystore"
+
+      - name: Rename APK
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          apk=$(find app/build/outputs/apk/free/release -maxdepth 1 -name '*.apk' | head -n1)
+          if [ -z "$apk" ]; then
+            echo "::error::No APK found under app/build/outputs/apk/free/release/"
+            exit 1
+          fi
+          mv "$apk" "app/build/outputs/apk/free/release/AntennaPod-free-${{ steps.version.outputs.name }}.apk"
+
+      - name: Create GitHub release and upload APK
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            ${{ steps.version.outputs.prerelease }} \
+            --title "AntennaPod ${{ steps.version.outputs.name }} (free flavor, auto-built)" \
+            --notes "Automated build of upstream AntennaPod ${{ steps.version.outputs.name }}, free/FOSS flavor (no Google Play Services), built and signed by this fork's build-release workflow. See https://github.com/AntennaPod/AntennaPod for the actual upstream project and changelog." \
+            "app/build/outputs/apk/free/release/AntennaPod-free-${{ steps.version.outputs.name }}.apk"
