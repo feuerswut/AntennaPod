@@ -1,0 +1,225 @@
+# One workflow, both branches. Keeps this fork (feuerswut/AntennaPod) in
+# lockstep with upstream AntennaPod/AntennaPod and builds a signed release
+# APK once main is in sync.
+#
+# Branch roles:
+#   main - the fork's release branch. Kept as a pure, unmodified fast-forward
+#          mirror of upstream's "master" (upstream's release-staging branch,
+#          which can be ahead of develop). This fork adds NOTHING to main, so
+#          a non-fast-forward push here can never happen unless something is
+#          genuinely wrong, and git will refuse it rather than rewrite
+#          anything.
+#   dev  - the fork's own default branch, kept as upstream's "develop" PLUS
+#          this fork's own automation commits (this file, its history, and
+#          nothing else). Since it's the default branch, this is the copy of
+#          the workflow file GitHub actually reads for the schedule trigger.
+#
+# The two mirror branches upstream/antennapod-main and upstream/antennapod-dev
+# are plain, always-overwritten reference copies of upstream's master/develop,
+# kept separate from main/dev themselves so a diff against "what upstream
+# actually has right now" is always available without touching the fork's own
+# branches.
+#
+# This used to be two separate files (sync-upstream.yml, build-release.yml).
+# Consolidated into one to avoid the two drifting out of sync with each
+# other's assumptions about branch names. The `sync` job runs once per branch
+# via a matrix, with a short switcher (matrix.role) at the top of each step
+# deciding whether that step applies to main (release) or dev (develop) -
+# no step acts on the wrong branch. `build-release` always builds from main
+# specifically, regardless of which branch's copy of this file triggered the
+# run, and only after `sync` has succeeded.
+name: Sync upstream and build release
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'feuerswut/AntennaPod'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - branch: main
+            role: release
+            upstream_branch: master
+            mirror_branch: upstream/antennapod-main
+          - branch: dev
+            role: develop
+            upstream_branch: develop
+            mirror_branch: upstream/antennapod-dev
+    steps:
+      - name: Checkout ${{ matrix.branch }}
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ matrix.branch }}
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/AntennaPod/AntennaPod.git
+
+      - name: Fetch upstream/${{ matrix.upstream_branch }}
+        run: git fetch upstream ${{ matrix.upstream_branch }}
+
+      # Detach straight onto upstream's own tree and force the mirror branch
+      # to exactly that commit -- never carries anything forward from
+      # whatever this runner's working tree had a moment ago.
+      - name: Update ${{ matrix.mirror_branch }} to exactly upstream/${{ matrix.upstream_branch }}
+        run: |
+          git push origin upstream/${{ matrix.upstream_branch }}:refs/heads/${{ matrix.mirror_branch }} --force
+
+      - name: "[release] Fast-forward main to upstream/master"
+        if: matrix.role == 'release'
+        run: |
+          git checkout ${{ matrix.branch }}
+          git merge --ff-only upstream/${{ matrix.upstream_branch }}
+          git push origin ${{ matrix.branch }}
+
+      - name: "[develop] Attempt fast-forward of dev"
+        if: matrix.role == 'develop'
+        id: ff
+        run: |
+          git checkout ${{ matrix.branch }}
+          if git merge --ff-only upstream/${{ matrix.upstream_branch }}; then
+            echo "result=ff-ok" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=diverged" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "[develop] Push fast-forwarded dev"
+        if: matrix.role == 'develop' && steps.ff.outputs.result == 'ff-ok'
+        run: git push origin ${{ matrix.branch }}
+
+      - name: "[develop] Rebase this fork's own commits onto upstream and push"
+        if: matrix.role == 'develop' && steps.ff.outputs.result == 'diverged'
+        run: |
+          set -e
+          if git rebase upstream/${{ matrix.upstream_branch }}; then
+            git push --force-with-lease origin ${{ matrix.branch }}
+          else
+            git rebase --abort
+            echo "::error::Could not cleanly rebase this fork's own commit(s) onto upstream/${{ matrix.upstream_branch }}." \
+                 " dev only carries this workflow's own history, so a conflict here is unexpected." \
+                 " Nothing was pushed to dev. Resolve by hand: fetch upstream, rebase locally, fix the conflict, force-push dev."
+            exit 1
+          fi
+
+  build-release:
+    needs: sync
+    if: github.repository == 'feuerswut/AntennaPod'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main (release branch)
+        uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - uses: gradle/actions/wrapper-validation@v5
+
+      - name: Cache Gradle
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('**/*.gradle*') }}-${{ hashFiles('**/gradle/wrapper/gradle-wrapper.properties') }}
+
+      - name: Read upstream version from app/build.gradle
+        id: version
+        run: |
+          version_name=$(grep -m1 'versionName ' app/build.gradle | sed -E 's/.*versionName\s+"([^"]+)".*/\1/')
+          if [ -z "$version_name" ]; then
+            echo "::error::Could not parse versionName from app/build.gradle"
+            exit 1
+          fi
+          echo "name=$version_name" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version_name" >> "$GITHUB_OUTPUT"
+          # Upstream's versionName carries a suffix for anything that is not a
+          # final release ("3.12.0-beta4", "-rc1"). Flag those as GitHub
+          # pre-releases so consumers can tell them apart.
+          if printf '%s' "$version_name" | grep -q -- '-'; then
+            echo "prerelease=--prerelease" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=--latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip if this version was already released
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${{ steps.version.outputs.tag }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${{ steps.version.outputs.tag }} already exists, nothing to do."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Secrets are passed through the environment, never interpolated into the
+      # shell script or the gradle command line.
+      - name: Decode signing keystore
+        if: steps.check.outputs.exists == 'false'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::Secret KEYSTORE_BASE64 is not set. Add KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS and KEY_PASSWORD in this repo's Settings -> Secrets and variables -> Actions before this workflow can produce a signed APK. Failing here on purpose rather than shipping an unsigned or fake-signed build."
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "${RUNNER_TEMP}/release.keystore"
+
+      - name: Build signed free-flavor release APK
+        if: steps.check.outputs.exists == 'false'
+        env:
+          ORG_GRADLE_PROJECT_releaseStoreFile: ${{ runner.temp }}/release.keystore
+          ORG_GRADLE_PROJECT_releaseStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
+          ORG_GRADLE_PROJECT_releaseKeyAlias: ${{ secrets.KEY_ALIAS }}
+          ORG_GRADLE_PROJECT_releaseKeyPassword: ${{ secrets.KEY_PASSWORD }}
+        run: ./gradlew assembleFreeRelease --stacktrace
+
+      - name: Remove decoded keystore
+        if: always()
+        run: rm -f "${RUNNER_TEMP}/release.keystore"
+
+      - name: Rename APK
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          apk=$(find app/build/outputs/apk/free/release -maxdepth 1 -name '*.apk' | head -n1)
+          if [ -z "$apk" ]; then
+            echo "::error::No APK found under app/build/outputs/apk/free/release/"
+            exit 1
+          fi
+          mv "$apk" "app/build/outputs/apk/free/release/AntennaPod-free-${{ steps.version.outputs.name }}.apk"
+
+      - name: Create GitHub release and upload APK
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            ${{ steps.version.outputs.prerelease }} \
+            --title "AntennaPod ${{ steps.version.outputs.name }} (free flavor, auto-built)" \
+            --notes "Automated build of upstream AntennaPod ${{ steps.version.outputs.name }}, free/FOSS flavor (no Google Play Services), built and signed by this fork's build-release workflow. See https://github.com/AntennaPod/AntennaPod for the actual upstream project and changelog." \
+            "app/build/outputs/apk/free/release/AntennaPod-free-${{ steps.version.outputs.name }}.apk"
