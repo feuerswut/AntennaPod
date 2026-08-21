@@ -37,6 +37,11 @@ on:
 
 permissions:
   contents: write
+  # The upstream/antennapod-dev mirror push carries upstream's own
+  # .github/workflows/*.yml changes straight through. Without this,
+  # GITHUB_TOKEN gets "refusing to allow a GitHub App to create or update
+  # workflow ... without `workflows` permission" and the whole job fails.
+  workflows: write
 
 concurrency:
   group: sync-upstream
