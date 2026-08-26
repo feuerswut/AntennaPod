@@ -84,11 +84,11 @@ jobs:
         run: |
           git push origin upstream/${{ matrix.upstream_branch }}:refs/heads/${{ matrix.mirror_branch }} --force
 
-      - name: "[release] Fast-forward main to upstream/master"
+      - name: "[release] Merge upstream/master into main"
         if: matrix.role == 'release'
         run: |
           git checkout ${{ matrix.branch }}
-          git merge --ff-only upstream/${{ matrix.upstream_branch }}
+          git merge upstream/${{ matrix.upstream_branch }} --no-edit -m "sync: merge upstream/${{ matrix.upstream_branch }}"
           git push origin ${{ matrix.branch }}
 
       - name: "[develop] Attempt fast-forward of dev"
@@ -108,6 +108,7 @@ jobs:
 
       - name: "[develop] Rebase this fork's own commits onto upstream and push"
         if: matrix.role == 'develop' && steps.ff.outputs.result == 'diverged'
+        continue-on-error: true
         run: |
           set -e
           if git rebase upstream/${{ matrix.upstream_branch }}; then
