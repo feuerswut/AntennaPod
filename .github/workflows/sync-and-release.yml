@@ -59,16 +59,32 @@ jobs:
             upstream_branch: develop
             mirror_branch: upstream/antennapod-dev
     steps:
+      # Mirroring upstream pushes upstream's commits, and some of them change files under
+      # .github/workflows. GitHub rejects such pushes from the built-in GITHUB_TOKEN
+      # ("refusing to allow a GitHub App to create or update workflow ... without `workflows`
+      # permission") and there is no `permissions:` entry that lifts this. SYNC_TOKEN must be a
+      # personal access token (fine-grained: Contents + Workflows read/write on this repo, or
+      # classic with the `repo` and `workflow` scopes). Without it the sync only works on days
+      # when upstream did not touch its workflows.
       - name: Checkout ${{ matrix.branch }}
         uses: actions/checkout@v5
         with:
           ref: ${{ matrix.branch }}
           fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Configure git identity
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Warn if SYNC_TOKEN is missing
+        env:
+          HAS_SYNC_TOKEN: ${{ secrets.SYNC_TOKEN != '' }}
+        run: |
+          if [ "$HAS_SYNC_TOKEN" != "true" ]; then
+            echo "::warning::Secret SYNC_TOKEN is not set; pushes that change upstream's workflow files will be rejected. See the comment above the checkout step."
+          fi
 
       - name: Add upstream remote
         run: git remote add upstream https://github.com/AntennaPod/AntennaPod.git
