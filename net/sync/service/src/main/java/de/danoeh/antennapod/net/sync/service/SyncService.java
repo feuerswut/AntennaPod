@@ -166,6 +166,12 @@ public class SyncService extends Worker {
                         || queuedRemovedFeeds.contains(redirectedUrl))) {
                 continue;
             }
+            // If the creator redirected their feed incorrectly, we still try to avoid duplicated subscriptions
+            String finalUrl = RedirectChecker.getFinalUrl(downloadUrl);
+            if (UrlChecker.containsUrl(localSubscriptions, finalUrl)
+                    || queuedRemovedFeeds.contains(finalUrl)) {
+                continue;
+            }
 
             Feed feed = new Feed(downloadUrl, null, "Unknown podcast");
             feed.setItems(Collections.emptyList());
@@ -280,6 +286,9 @@ public class SyncService extends Worker {
             }
             FeedMedia media = feedItem.getMedia();
             media.setPosition(action.getPosition() * 1000);
+            if (media.getPosition() > 0 && feedItem.isNew()) {
+                feedItem.setPlayed(false);
+            }
             int smartMarkAsPlayedSecs = UserPreferences.getSmartMarkAsPlayedSecs();
             boolean almostEnded = media.getDuration() > 0
                     && media.getPosition() >= media.getDuration() - smartMarkAsPlayedSecs * 1000;

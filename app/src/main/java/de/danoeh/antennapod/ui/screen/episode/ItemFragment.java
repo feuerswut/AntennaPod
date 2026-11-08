@@ -1,9 +1,6 @@
 package de.danoeh.antennapod.ui.screen.episode;
 
-import android.content.ClipData;
-import android.content.ClipboardManager;
 import android.content.Context;
-import android.os.Build;
 import android.os.Bundle;
 import android.text.Layout;
 import android.text.TextUtils;
@@ -38,6 +35,7 @@ import de.danoeh.antennapod.actionbutton.StreamActionButton;
 import de.danoeh.antennapod.actionbutton.VisitWebsiteActionButton;
 import de.danoeh.antennapod.activity.MainActivity;
 import de.danoeh.antennapod.databinding.FeeditemFragmentBinding;
+import de.danoeh.antennapod.ui.common.ClipboardUtils;
 import de.danoeh.antennapod.event.EpisodeDownloadEvent;
 import de.danoeh.antennapod.event.FeedItemEvent;
 import de.danoeh.antennapod.event.FeedListUpdateEvent;
@@ -48,7 +46,7 @@ import de.danoeh.antennapod.model.feed.FeedItem;
 import de.danoeh.antennapod.model.feed.FeedMedia;
 import de.danoeh.antennapod.net.download.serviceinterface.DownloadServiceInterface;
 import de.danoeh.antennapod.playback.service.PlaybackController;
-import de.danoeh.antennapod.playback.service.PlaybackService;
+import de.danoeh.antennapod.playback.service.PlaybackServiceInterface;
 import de.danoeh.antennapod.playback.service.PlaybackStatus;
 import de.danoeh.antennapod.storage.database.DBReader;
 import de.danoeh.antennapod.storage.preferences.UsageStatistics;
@@ -121,14 +119,21 @@ public class ItemFragment extends Fragment {
         viewBinding.txtvTitle.setHyphenationFrequency(Layout.HYPHENATION_FREQUENCY_FULL);
         viewBinding.txtvTitle.setEllipsize(TextUtils.TruncateAt.END);
         viewBinding.webvDescription.setTimecodeSelectedListener(time -> {
-            if (!PlaybackService.isRunning) {
+            if (!PlaybackServiceInterface.isPlaying) {
                 EventBus.getDefault().post(
                         new MessageEvent(getString(R.string.play_this_to_seek_position_message)));
                 return;
             }
             if (BuildConfig.USE_MEDIA3_PLAYBACK_SERVICE) {
-                PlaybackController.bindToMedia3Service(getActivity(), controller ->
-                        controller.seekTo(time));
+                PlaybackController.bindToMedia3Service(getActivity(), controller -> {
+                    if (item.getMedia() != null && controller.getCurrentMediaItem() != null
+                            && ("" + item.getMedia().getId()).equals(controller.getCurrentMediaItem().mediaId)) {
+                        controller.seekTo(time);
+                    } else {
+                        EventBus.getDefault().post(
+                                new MessageEvent(getString(R.string.play_this_to_seek_position_message)));
+                    }
+                });
                 return;
             }
             PlaybackController.bindToService(getActivity(), playbackService -> {
@@ -165,25 +170,14 @@ public class ItemFragment extends Fragment {
             actionButton2.onClick(getContext());
         });
         viewBinding.txtvPodcast.setOnLongClickListener(v -> {
-            copyToClipboard(requireContext(), viewBinding.txtvPodcast.getText().toString());
+            ClipboardUtils.copyText(viewBinding.txtvPodcast);
             return true;
         });
         viewBinding.txtvTitle.setOnLongClickListener(v -> {
-            copyToClipboard(requireContext(), viewBinding.txtvTitle.getText().toString());
+            ClipboardUtils.copyText(viewBinding.txtvTitle);
             return true;
         });
         return viewBinding.getRoot();
-    }
-
-    public void copyToClipboard(Context context, String text) {
-        ClipboardManager clipboard = (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
-        if (clipboard != null) {
-            ClipData clip = ClipData.newPlainText(text, text);
-            clipboard.setPrimaryClip(clip);
-            if (Build.VERSION.SDK_INT <= 32) {
-                EventBus.getDefault().post(new MessageEvent(getString(R.string.copied_to_clipboard)));
-            }
-        }
     }
 
     private void showOnDemandConfigBalloon(boolean offerStreaming) {

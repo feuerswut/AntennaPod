@@ -32,6 +32,12 @@ public class ItemSortDialog extends BottomSheetDialogFragment {
         return viewBinding.getRoot();
     }
 
+    @Override
+    public void onDestroyView() {
+        super.onDestroyView();
+        viewBinding = null;
+    }
+
     protected void populateList() {
         viewBinding.gridLayout.removeAllViews();
         onAddItem(R.string.episode_title, SortOrder.EPISODE_TITLE_A_Z, SortOrder.EPISODE_TITLE_Z_A, true);
@@ -48,15 +54,17 @@ public class ItemSortDialog extends BottomSheetDialogFragment {
         if (sortOrder == ascending || sortOrder == descending) {
             SortDialogItemActiveBinding item = SortDialogItemActiveBinding.inflate(
                     getLayoutInflater(), viewBinding.gridLayout, false);
+            item.button.setText(title);
             SortOrder other;
             if (ascending == descending) {
-                item.button.setText(title);
                 other = ascending;
             } else if (sortOrder == ascending) {
-                item.button.setText(getString(title) + "\u00A0▲");
+                item.button.setCompoundDrawablesRelativeWithIntrinsicBounds(0, 0, R.drawable.ic_arrow_full_up, 0);
+                item.button.setContentDescription(getString(R.string.sort_ascending_description, getString(title)));
                 other = descending;
             } else {
-                item.button.setText(getString(title) + "\u00A0▼");
+                item.button.setCompoundDrawablesRelativeWithIntrinsicBounds(0, 0, R.drawable.ic_arrow_full_down, 0);
+                item.button.setContentDescription(getString(R.string.sort_descending_description, getString(title)));
                 other = ascending;
             }
             item.button.setOnClickListener(v -> {
