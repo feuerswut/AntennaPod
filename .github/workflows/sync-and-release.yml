@@ -35,7 +35,7 @@ jobs:
       matrix:
         include:
           - branch: main
-            upstream_branch: master
+            upstream_branch: develop
           - branch: dev
             upstream_branch: develop
     steps:
